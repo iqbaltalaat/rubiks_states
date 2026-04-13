@@ -1,60 +1,272 @@
 import sys
-import math, random
-
-from PyQt5.QtCore import (QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime,
-        QTimer)
-from PyQt5.QtGui import (QBrush, QColor, QFontMetrics, QImage, QPainter,
-        QRadialGradient, QSurfaceFormat)
+import ctypes
+import numpy as np
+from PyQt5.QtCore import QPoint, QSize, Qt
 from PyQt5.QtWidgets import QApplication, QOpenGLWidget
-
+from PyQt5.QtGui import QSurfaceFormat
 import OpenGL.GL as gl
 
+from rubiks_states import get_matrix, add_to_hash_set
+from rubiks_states import solver as bfs_step
 
-class GLWidget(QOpenGLWidget):
-    def __init__(self, parent=None):
-        super(GLWidget, self).__init__(parent)
+# ── Shaders ───────────────────────────────────────────────────────────────────
 
-        midnight = QTime(0, 0, 0)
-        random.seed(midnight.secsTo(QTime.currentTime()))
+VERT_SRC = """\
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
 
-        self.object = 0
-        self.xRot = 0
-        self.yRot = 0
-        self.zRot = 0
-        self.image = QImage()
-        self.lastPos = QPoint()
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform vec3 uColor;
 
-        self.Purple = QColor.fromCmykF(0.39, 0.39, 0.0, 0.0)
+out vec3 vColor;
+out vec3 vNormal;
+out vec3 vFragPos;
 
-        self.animationTimer = QTimer()
-        self.animationTimer.setSingleShot(False)
-        self.animationTimer.timeout.connect(self.animate)
-        self.animationTimer.start(25)
+void main() {
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    vFragPos    = vec3(uModel * vec4(aPos, 1.0));
+    vNormal     = normalize(mat3(transpose(inverse(uModel))) * aNormal);
+    vColor      = uColor;
+}
+"""
 
-        self.setAutoFillBackground(False)
-        self.setMinimumSize(400, 400)
-        self.setWindowTitle("Overpainting a Scene")
+FRAG_SRC = """\
+#version 330 core
+in vec3 vColor;
+in vec3 vNormal;
+in vec3 vFragPos;
 
-    def setXRotation(self, angle):
-        angle = self.normalizeAngle(angle)
-        if angle != self.xRot:
-            self.xRot = angle
+out vec4 FragColor;
 
-    def setYRotation(self, angle):
-        angle = self.normalizeAngle(angle)
-        if angle != self.yRot:
-            self.yRot = angle
+uniform vec3 uLightPos;
+uniform vec3 uViewPos;
 
-    def setZRotation(self, angle):
-        angle = self.normalizeAngle(angle)
-        if angle != self.zRot:
-            self.zRot = angle
+void main() {
+    vec3 ambient  = 0.35 * vColor;
+    vec3 lightDir = normalize(uLightPos - vFragPos);
+    float diff    = max(dot(vNormal, lightDir), 0.0);
+    vec3 diffuse  = diff * vColor;
+    vec3 viewDir  = normalize(uViewPos - vFragPos);
+    vec3 reflDir  = reflect(-lightDir, vNormal);
+    float spec    = pow(max(dot(viewDir, reflDir), 0.0), 32.0);
+    vec3 specular = 0.25 * spec * vec3(1.0);
+    FragColor = vec4(ambient + diffuse + specular, 1.0);
+}
+"""
+
+# ── Cube geometry (all 6 faces, positions + normals) ─────────────────────────
+
+CUBE_VERTS = np.array([
+    # position           normal
+    # Front  (+z)
+    -0.5, -0.5,  0.5,   0,  0,  1,
+     0.5, -0.5,  0.5,   0,  0,  1,
+     0.5,  0.5,  0.5,   0,  0,  1,
+    -0.5,  0.5,  0.5,   0,  0,  1,
+    # Back   (-z)
+    -0.5, -0.5, -0.5,   0,  0, -1,
+    -0.5,  0.5, -0.5,   0,  0, -1,
+     0.5,  0.5, -0.5,   0,  0, -1,
+     0.5, -0.5, -0.5,   0,  0, -1,
+    # Top    (+y)
+    -0.5,  0.5, -0.5,   0,  1,  0,
+    -0.5,  0.5,  0.5,   0,  1,  0,
+     0.5,  0.5,  0.5,   0,  1,  0,
+     0.5,  0.5, -0.5,   0,  1,  0,
+    # Bottom (-y)
+    -0.5, -0.5, -0.5,   0, -1,  0,
+     0.5, -0.5, -0.5,   0, -1,  0,
+     0.5, -0.5,  0.5,   0, -1,  0,
+    -0.5, -0.5,  0.5,   0, -1,  0,
+    # Right  (+x)
+     0.5, -0.5, -0.5,   1,  0,  0,
+     0.5,  0.5, -0.5,   1,  0,  0,
+     0.5,  0.5,  0.5,   1,  0,  0,
+     0.5, -0.5,  0.5,   1,  0,  0,
+    # Left   (-x)
+    -0.5, -0.5, -0.5,  -1,  0,  0,
+    -0.5, -0.5,  0.5,  -1,  0,  0,
+    -0.5,  0.5,  0.5,  -1,  0,  0,
+    -0.5,  0.5, -0.5,  -1,  0,  0,
+], dtype=np.float32)
+
+CUBE_IDX = np.array([
+     0,  1,  2,   0,  2,  3,
+     4,  5,  6,   4,  6,  7,
+     8,  9, 10,   8, 10, 11,
+    12, 13, 14,  12, 14, 15,
+    16, 17, 18,  16, 18, 19,
+    20, 21, 22,  20, 22, 23,
+], dtype=np.uint32)
+
+# One colour per cell value (1–8)
+COLORS = [
+    (0.90, 0.12, 0.12),  # 1  red
+    (0.12, 0.78, 0.12),  # 2  green
+    (0.15, 0.25, 0.90),  # 3  blue
+    (0.90, 0.88, 0.10),  # 4  yellow
+    (0.92, 0.50, 0.10),  # 5  orange
+    (0.80, 0.10, 0.80),  # 6  magenta
+    (0.10, 0.80, 0.80),  # 7  cyan
+    (0.95, 0.95, 0.95),  # 8  white
+]
+
+# ── Matrix helpers (row-major; passed to GL with transpose=True) ──────────────
+
+def persp(fov_deg, aspect, near, far):
+    f = 1.0 / np.tan(np.radians(fov_deg) / 2)
+    m = np.zeros((4, 4), dtype=np.float32)
+    m[0, 0] = f / aspect
+    m[1, 1] = f
+    m[2, 2] = (far + near) / (near - far)
+    m[2, 3] = (2 * far * near) / (near - far)
+    m[3, 2] = -1.0
+    return m
+
+def translate(tx, ty, tz):
+    m = np.eye(4, dtype=np.float32)
+    m[0, 3] = tx; m[1, 3] = ty; m[2, 3] = tz
+    return m
+
+def rot_x(deg):
+    r = np.radians(deg); c, s = float(np.cos(r)), float(np.sin(r))
+    m = np.eye(4, dtype=np.float32)
+    m[1, 1] =  c; m[1, 2] = -s
+    m[2, 1] =  s; m[2, 2] =  c
+    return m
+
+def rot_y(deg):
+    r = np.radians(deg); c, s = float(np.cos(r)), float(np.sin(r))
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0] =  c; m[0, 2] =  s
+    m[2, 0] = -s; m[2, 2] =  c
+    return m
+
+def uniform_scale(s):
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0] = m[1, 1] = m[2, 2] = s
+    return m
+
+# ── Solver integration ────────────────────────────────────────────────────────
+
+def collect_states():
+    """BFS over all reachable 2×2 cube states; returns list of state matrices."""
+    hash_set = set()
+    cube_size = 2
+    genesis = get_matrix(cube_size)
+    genesis_hash, _ = add_to_hash_set(genesis, hash_set)
+
+    all_states = [genesis.copy()]
+    frontier = {genesis_hash: genesis}
+
+    while frontier:
+        new_frontier = {}
+        for matrix in frontier.values():
+            new_states = bfs_step(matrix, hash_set, cube_size)
+            for h, m in new_states.items():
+                all_states.append(m.copy())
+            new_frontier.update(new_states)
+        frontier = new_frontier
+
+    return all_states
+
+# ── GL Widget ─────────────────────────────────────────────────────────────────
+
+class RubiksGLWidget(QOpenGLWidget):
+    SPACING = 1.08   # centre-to-centre distance between adjacent cubies
+    CUBIE   = 0.92   # cubie edge length (leaves a small gap at each face)
+    CAM_Z   = 6.0    # camera distance along +z
+
+    def __init__(self, states, parent=None):
+        super().__init__(parent)
+        self.states    = states
+        self.state_idx = 0
+        self.xRot      = 25.0
+        self.yRot      = -40.0
+        self.lastPos   = QPoint()
+        self._prog = self._vao = self._vbo = self._ebo = None
+        self.setMinimumSize(600, 600)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._update_title()
+
+    def sizeHint(self):
+        return QSize(600, 600)
 
     def initializeGL(self):
-        # gl = self.context().versionFunctions()
-        # gl.initializeOpenGLFunctions()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_MULTISAMPLE)
+        gl.glClearColor(0.13, 0.13, 0.13, 1.0)
 
-        self.object = self.makeObject()
+        self._prog = self._build_program(VERT_SRC, FRAG_SRC)
+
+        self._vao = gl.glGenVertexArrays(1)
+        gl.glBindVertexArray(self._vao)
+
+        self._vbo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, CUBE_VERTS.nbytes, CUBE_VERTS, gl.GL_STATIC_DRAW)
+
+        self._ebo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
+        gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, CUBE_IDX.nbytes, CUBE_IDX, gl.GL_STATIC_DRAW)
+
+        stride = 6 * CUBE_VERTS.itemsize
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride,
+                                 ctypes.c_void_p(3 * CUBE_VERTS.itemsize))
+        gl.glEnableVertexAttribArray(1)
+
+        gl.glBindVertexArray(0)
+
+    def paintGL(self):
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        gl.glUseProgram(self._prog)
+        gl.glBindVertexArray(self._vao)
+
+        w, h = max(self.width(), 1), max(self.height(), 1)
+        proj  = persp(45.0, w / h, 0.1, 100.0)
+        view  = translate(0.0, 0.0, -self.CAM_Z)
+        orbit = rot_x(self.xRot) @ rot_y(self.yRot)
+
+        self._setv('uLightPos', np.array([5.0, 7.0, 8.0], dtype=np.float32))
+        self._setv('uViewPos',  np.array([0.0, 0.0, self.CAM_Z], dtype=np.float32))
+
+        matrix = self.states[self.state_idx]
+        sz   = matrix.shape[0]
+        half = (sz - 1) * self.SPACING * 0.5
+
+        for i in range(sz):
+            for j in range(sz):
+                for k in range(sz):
+                    tx = i * self.SPACING - half
+                    ty = j * self.SPACING - half
+                    tz = k * self.SPACING - half
+                    # scale → translate to position → orbit the whole cube
+                    model = orbit @ translate(tx, ty, tz) @ uniform_scale(self.CUBIE)
+                    mvp   = proj @ view @ model
+                    self._setm('uMVP',   mvp)
+                    self._setm('uModel', model)
+                    self._setv('uColor', np.array(COLORS[matrix[i, j, k] - 1], dtype=np.float32))
+                    gl.glDrawElements(gl.GL_TRIANGLES, len(CUBE_IDX), gl.GL_UNSIGNED_INT, None)
+
+        gl.glBindVertexArray(0)
+
+    def resizeGL(self, w, h):
+        gl.glViewport(0, 0, w, h)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Right, Qt.Key_Up):
+            self.state_idx = (self.state_idx + 1) % len(self.states)
+        elif key in (Qt.Key_Left, Qt.Key_Down):
+            self.state_idx = (self.state_idx - 1) % len(self.states)
+        else:
+            return
+        self._update_title()
+        self.update()
 
     def mousePressEvent(self, event):
         self.lastPos = event.pos()
@@ -62,129 +274,67 @@ class GLWidget(QOpenGLWidget):
     def mouseMoveEvent(self, event):
         dx = event.x() - self.lastPos.x()
         dy = event.y() - self.lastPos.y()
-
         if event.buttons() & Qt.LeftButton:
-            self.setXRotation(self.xRot + 8 * dy)
-            self.setYRotation(self.yRot + 8 * dx)
-        elif event.buttons() & Qt.RightButton:
-            self.setXRotation(self.xRot + 8 * dy)
-            self.setZRotation(self.zRot + 8 * dx)
-
+            self.xRot += dy * 0.4
+            self.yRot += dx * 0.4
+            self.update()
         self.lastPos = event.pos()
 
-    def paintEvent(self, event):
-        self.makeCurrent()
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glPushMatrix()
+    def _update_title(self):
+        self.setWindowTitle(
+            f"Rubik's States  [{self.state_idx + 1} / {len(self.states)}]"
+            "   ← → cycle states   drag to rotate"
+        )
 
-        self.setClearColor(self.Purple.darker())
-        gl.glShadeModel(gl.GL_SMOOTH)
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        #gl.glEnable(gl.GL_CULL_FACE)
-        gl.glEnable(gl.GL_LIGHTING)
-        gl.glEnable(gl.GL_LIGHT0)
-        gl.glEnable(gl.GL_MULTISAMPLE)
-        gl.glLightfv(gl.GL_LIGHT0, gl.GL_POSITION,
-                (0.5, 5.0, 7.0, 1.0))
+    def _u(self, name):
+        return gl.glGetUniformLocation(self._prog, name)
 
-        self.setupViewport(self.width(), self.height())
+    def _setm(self, name, m):
+        gl.glUniformMatrix4fv(self._u(name), 1, gl.GL_TRUE, m)
 
-        gl.glClear(
-                gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-        gl.glLoadIdentity()
-        gl.glTranslated(0.0, 0.0, -10.0)
-        gl.glRotated(self.xRot / 16.0, 1.0, 0.0, 0.0)
-        gl.glRotated(self.yRot / 16.0, 0.0, 1.0, 0.0)
-        gl.glRotated(self.zRot / 16.0, 0.0, 0.0, 1.0)
-        gl.glCallList(self.object)
+    def _setv(self, name, v):
+        gl.glUniform3fv(self._u(name), 1, v)
 
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glPopMatrix()
+    @staticmethod
+    def _build_program(vs_src, fs_src):
+        def compile_shader(src, kind):
+            s = gl.glCreateShader(kind)
+            gl.glShaderSource(s, src)
+            gl.glCompileShader(s)
+            if not gl.glGetShaderiv(s, gl.GL_COMPILE_STATUS):
+                raise RuntimeError(gl.glGetShaderInfoLog(s).decode())
+            return s
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        painter.end()
-
-    def resizeGL(self, width, height):
-        self.setupViewport(width, height)
-
-
-    def sizeHint(self):
-        return QSize(400, 400)
-
-    def makeObject(self):
-        genList = gl.glGenLists(1)
-        gl.glNewList(genList, gl.GL_COMPILE)
-
-        self.setColor(QColor.fromCmykF(1.0, 0.0, 0.0, 0.0))
-        gl.glBegin(gl.GL_QUADS)
-
-        gl.glNormal3d(0.0, 1.0, 0.0);
-        gl.glVertex3d(-0.5, 0.5, 0.5);
-        gl.glVertex3d(0.5, 0.5, 0.5);
-        gl.glVertex3d(0.5, 0.5, -0.5);
-        gl.glVertex3d(-0.5, 0.5, -0.5);
-        gl.glEnd()
-
-        gl.glBegin(gl.GL_QUADS)
-        gl.glNormal3d(0.0, 0.0, 1.0);
-        gl.glVertex3d(0.5, -0.5, 0.5);
-        gl.glVertex3d(0.5, 0.5, 0.5);
-        gl.glVertex3d(-0.5, 0.5, 0.5);
-        gl.glVertex3d(-0.5, -0.5, 0.5);
-        gl.glEnd()
-
-        gl.glBegin(gl.GL_QUADS)
-        gl.glNormal3d(1.0, 0.0, 0.0);
-        gl.glVertex3d(0.5, 0.5, -0.5);
-        gl.glVertex3d(0.5, 0.5, 0.5);
-        gl.glVertex3d(0.5, -0.5, 0.5);
-        gl.glVertex3d(0.5, -0.5, -0.5);
-        gl.glEnd()
+        vs   = compile_shader(vs_src, gl.GL_VERTEX_SHADER)
+        fs   = compile_shader(fs_src, gl.GL_FRAGMENT_SHADER)
+        prog = gl.glCreateProgram()
+        gl.glAttachShader(prog, vs)
+        gl.glAttachShader(prog, fs)
+        gl.glLinkProgram(prog)
+        if not gl.glGetProgramiv(prog, gl.GL_LINK_STATUS):
+            raise RuntimeError(gl.glGetProgramInfoLog(prog).decode())
+        gl.glDeleteShader(vs)
+        gl.glDeleteShader(fs)
+        return prog
 
 
-        gl.glEndList()
-
-        return genList
-
-
-    def normalizeAngle(self, angle):
-        while angle < 0:
-            angle += 360 * 16
-        while angle > 360 * 16:
-            angle -= 360 * 16
-        return angle
-
-    def animate(self):
-        self.update()
-
-    def setupViewport(self, width, height):
-        side = min(width, height)
-        gl.glViewport((width - side) // 2, (height - side) // 2, side,
-                side)
-
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glLoadIdentity()
-        gl.glOrtho(-0.5, +0.5, +0.5, -0.5, 4.0, 15.0)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-
-    def setClearColor(self, c):
-        gl.glClearColor(c.redF(), c.greenF(), c.blueF(), c.alphaF())
-
-    def setColor(self, c):
-        gl.glColor4f(c.redF(), c.greenF(), c.blueF(), c.alphaF())
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-
-    app = QApplication(sys.argv)
-
+    # Must be set before QApplication is created
     fmt = QSurfaceFormat()
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
     fmt.setSamples(4)
     QSurfaceFormat.setDefaultFormat(fmt)
 
-    window = GLWidget()
+    print("Running solver...")
+    states = collect_states()
+    print(f"Found {len(states)} unique states.")
+
+    app = QApplication(sys.argv)
+    window = RubiksGLWidget(states)
     window.show()
     sys.exit(app.exec_())
